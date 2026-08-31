@@ -1,0 +1,429 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// TeamFlow — Prisma schema (PostgreSQL)
+// Conventions:
+//   • UUID primary keys, `createdAt` / `updatedAt` timestamps everywhere
+//   • Explicit `@@index` for every hot query path (see docs/DATABASE.md)
+//   • `onDelete: Cascade` only where a child has no meaning without its parent
+//   • Ordering is persisted (`Task.position`) so the Kanban board is stable
+// ─────────────────────────────────────────────────────────────────────────────
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ───────────────────────────── Enums ─────────────────────────────────────────
+
+enum WorkspaceRole {
+  OWNER
+  ADMIN
+  MEMBER
+}
+
+enum ProjectStatus {
+  PLANNING
+  ACTIVE
+  ON_HOLD
+  COMPLETED
+  ARCHIVED
+}
+
+enum TaskStatus {
+  TODO
+  IN_PROGRESS
+  REVIEW
+  DONE
+}
+
+enum TaskPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum ChannelType {
+  GENERAL
+  PROJECT
+}
+
+enum NotificationType {
+  TASK_ASSIGNED
+  TASK_UPDATED
+  TASK_COMMENTED
+  TASK_DUE_SOON
+  PROJECT_ADDED
+  WORKSPACE_ROLE_CHANGED
+  WORKSPACE_INVITED
+  MENTION
+}
+
+enum ActivityType {
+  WORKSPACE_CREATED
+  WORKSPACE_UPDATED
+  PROJECT_CREATED
+  PROJECT_UPDATED
+  PROJECT_ARCHIVED
+  PROJECT_DELETED
+  TASK_CREATED
+  TASK_UPDATED
+  TASK_ASSIGNED
+  TASK_STATUS_CHANGED
+  TASK_MOVED
+  TASK_COMPLETED
+  TASK_DELETED
+  COMMENT_CREATED
+  COMMENT_DELETED
+  MEMBER_ADDED
+  MEMBER_REMOVED
+  ROLE_CHANGED
+  INVITATION_CREATED
+  MESSAGE_SENT
+}
+
+// ───────────────────────────── Identity ──────────────────────────────────────
+
+model User {
+  id           String    @id @default(uuid()) @db.Uuid
+  email        String    @unique
+  name         String
+  passwordHash String
+  avatarUrl    String?
+  bio          String?
+  /// Server-side presence anchor: refreshed (throttled) while a user is
+  /// connected over Socket.IO and on login. Used for "last seen" only.
+  lastSeenAt   DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  memberships       WorkspaceMember[]
+  membershipsLeft   WorkspaceMember[]     @relation("InvitedBy")
+  projectRoles      ProjectMember[]
+  assignedTasks     Task[]                @relation("TaskAssignee")
+  reportedTasks     Task[]                @relation("TaskReporter")
+  comments          Comment[]
+  messages          Message[]
+  attachments       Attachment[]          @relation("AttachmentAuthor")
+  notifications     Notification[]
+  triggeredNotifications Notification[] @relation("NotificationActor")
+  activities        ActivityLog[]
+  createdWorkspaces Workspace[]           @relation("WorkspaceCreator")
+  createdProjects   Project[]             @relation("ProjectCreator")
+  refreshTokens     RefreshToken[]
+  passwordResets    PasswordResetToken[]
+  invitationsSent   WorkspaceInvitation[] @relation("InvitationInvitedBy")
+
+  @@index([lastSeenAt])
+}
+
+/// Short-lived access tokens are never persisted; refresh tokens are stored
+/// hashed so they can be rotated and revoked (logout invalidates the family).
+model RefreshToken {
+  id           String    @id @default(uuid()) @db.Uuid
+  userId       String    @db.Uuid
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash    String    @unique
+  expiresAt    DateTime
+  revokedAt    DateTime?
+  replacedById String?   @db.Uuid
+  userAgent    String?
+  createdAt    DateTime  @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model PasswordResetToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @db.Uuid
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+}
+
+// ───────────────────────────── Workspaces ────────────────────────────────────
+
+model Workspace {
+  id          String   @id @default(uuid()) @db.Uuid
+  name        String
+  slug        String   @unique
+  description String?
+  accentColor String   @default("indigo")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  creatorId     String                @db.Uuid
+  creator       User                  @relation("WorkspaceCreator", fields: [creatorId], references: [id], onDelete: Restrict)
+  members       WorkspaceMember[]
+  invitations   WorkspaceInvitation[]
+  projects      Project[]
+  channels      Channel[]
+  labels        Label[]
+  tasks         Task[]
+  notifications Notification[]
+  activities    ActivityLog[]
+
+  @@index([creatorId])
+}
+
+model WorkspaceMember {
+  id          String        @id @default(uuid()) @db.Uuid
+  workspaceId String        @db.Uuid
+  workspace   Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  userId      String        @db.Uuid
+  user        User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role        WorkspaceRole @default(MEMBER)
+  invitedById String?       @db.Uuid
+  invitedBy   User?         @relation("InvitedBy", fields: [invitedById], references: [id], onDelete: SetNull)
+  joinedAt    DateTime      @default(now())
+
+  @@unique([workspaceId, userId])
+  @@index([userId])
+  @@index([workspaceId, role])
+}
+
+model WorkspaceInvitation {
+  id          String        @id @default(uuid()) @db.Uuid
+  workspaceId String        @db.Uuid
+  workspace   Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  email       String
+  role        WorkspaceRole @default(MEMBER)
+  tokenHash   String        @unique
+  message     String?
+  invitedById String?       @db.Uuid
+  invitedBy   User?         @relation("InvitationInvitedBy", fields: [invitedById], references: [id], onDelete: SetNull)
+  acceptedAt  DateTime?
+  expiresAt   DateTime
+  createdAt   DateTime      @default(now())
+
+  /// Only one live invitation per e-mail address per workspace.
+  @@unique([workspaceId, email])
+  @@index([email])
+  @@index([tokenHash])
+}
+
+// ───────────────────────────── Projects ──────────────────────────────────────
+
+model Project {
+  id          String        @id @default(uuid()) @db.Uuid
+  workspaceId String        @db.Uuid
+  workspace   Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  key         String
+  name        String
+  description String?
+  status      ProjectStatus @default(PLANNING)
+  color       String        @default("indigo")
+  startDate   DateTime?
+  dueDate     DateTime?
+  archivedAt  DateTime?
+  createdById String        @db.Uuid
+  createdBy   User          @relation("ProjectCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  members  ProjectMember[]
+  tasks    Task[]
+  channels Channel[]
+
+  /// `key` is the short task prefix (e.g. "WEB-14") — unique per workspace.
+  @@unique([workspaceId, key])
+  @@index([workspaceId, status])
+  @@index([workspaceId, archivedAt])
+}
+
+/// Explicit project membership: private projects are only visible to their
+/// members, `visibility = WORKSPACE` shares them with every workspace member.
+model ProjectMember {
+  id        String   @id @default(uuid()) @db.Uuid
+  projectId String   @db.Uuid
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  userId    String   @db.Uuid
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([projectId, userId])
+  @@index([userId])
+}
+
+// ───────────────────────────── Tasks ─────────────────────────────────────────
+
+model Task {
+  id          String       @id @default(uuid()) @db.Uuid
+  reference   String       @unique
+  projectId   String       @db.Uuid
+  project     Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  /// Denormalised for fast workspace-wide queries (my tasks, filters, counts).
+  workspaceId String       @db.Uuid
+  workspace   Workspace    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  title       String
+  description String?
+  status      TaskStatus   @default(TODO)
+  priority    TaskPriority @default(MEDIUM)
+  /// Ordering *within* (project, status). Maintained by the move service.
+  position    Int          @default(0)
+  dueDate     DateTime?
+  completedAt DateTime?
+  estimate    Int?
+  assigneeId  String?      @db.Uuid
+  assignee    User?        @relation("TaskAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+  reporterId  String       @db.Uuid
+  reporter    User         @relation("TaskReporter", fields: [reporterId], references: [id], onDelete: Cascade)
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  labels      TaskLabel[]
+  comments    Comment[]
+  attachments Attachment[]
+
+  @@index([projectId, status, position])
+  @@index([workspaceId, status])
+  @@index([workspaceId, dueDate])
+  @@index([assigneeId, status])
+  @@index([reporterId])
+  @@index([completedAt])
+}
+
+model Label {
+  id          String    @id @default(uuid()) @db.Uuid
+  workspaceId String    @db.Uuid
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  name        String
+  color       String    @default("slate")
+  createdAt   DateTime  @default(now())
+
+  tasks TaskLabel[]
+
+  @@unique([workspaceId, name])
+}
+
+model TaskLabel {
+  taskId  String @db.Uuid
+  task    Task   @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  labelId String @db.Uuid
+  label   Label  @relation(fields: [labelId], references: [id], onDelete: Cascade)
+
+  @@id([taskId, labelId])
+  @@index([labelId])
+}
+
+model Comment {
+  id        String    @id @default(uuid()) @db.Uuid
+  taskId    String    @db.Uuid
+  task      Task      @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  authorId  String    @db.Uuid
+  author    User      @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  body      String
+  editedAt  DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  @@index([taskId, createdAt])
+  @@index([authorId])
+}
+
+/// Attachments are link-based (title + url): no file storage is required to
+/// keep a task's context, and links are trivially revocable/searchable.
+model Attachment {
+  id        String   @id @default(uuid()) @db.Uuid
+  taskId    String   @db.Uuid
+  task      Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  label     String
+  url       String
+  addedById String   @db.Uuid
+  addedBy   User     @relation("AttachmentAuthor", fields: [addedById], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@index([taskId])
+}
+
+// ───────────────────────────── Chat ──────────────────────────────────────────
+
+model Channel {
+  id          String      @id @default(uuid()) @db.Uuid
+  workspaceId String      @db.Uuid
+  workspace   Workspace   @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  type        ChannelType @default(GENERAL)
+  name        String
+  topic       String?
+  projectId   String?     @db.Uuid
+  project     Project?    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  messages Message[]
+
+  @@unique([workspaceId, name])
+  @@index([workspaceId, type])
+  @@index([projectId])
+}
+
+model Message {
+  id        String    @id @default(uuid()) @db.Uuid
+  channelId String    @db.Uuid
+  channel   Channel   @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  authorId  String    @db.Uuid
+  author    User      @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  body      String
+  editedAt  DateTime?
+  deletedAt DateTime?
+  /// Monotonic per-channel cursor used for pagination + unread counters.
+  seq       BigInt    @default(autoincrement())
+  createdAt DateTime  @default(now())
+
+  @@index([channelId, seq])
+  @@index([authorId])
+  @@index([channelId, deletedAt])
+}
+
+// ──────────────────────── Notifications / activity ───────────────────────────
+
+model Notification {
+  id          String           @id @default(uuid()) @db.Uuid
+  recipientId String           @db.Uuid
+  recipient   User             @relation(fields: [recipientId], references: [id], onDelete: Cascade)
+  workspaceId String?          @db.Uuid
+  workspace   Workspace?       @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  type        NotificationType
+  title       String
+  body        String?
+  actorId     String?          @db.Uuid
+  actor       User?            @relation("NotificationActor", fields: [actorId], references: [id], onDelete: SetNull)
+  taskId      String?          @db.Uuid
+  projectId   String?          @db.Uuid
+  channelId   String?          @db.Uuid
+  commentId   String?          @db.Uuid
+  /// Deep link the client routes to, e.g. `/app/workspaces/<id>/projects/<id>`.
+  link        String?
+  readAt      DateTime?
+  createdAt   DateTime         @default(now())
+
+  @@index([recipientId, readAt, createdAt])
+  @@index([workspaceId])
+}
+
+model ActivityLog {
+  id          String       @id @default(uuid()) @db.Uuid
+  workspaceId String       @db.Uuid
+  workspace   Workspace    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  projectId   String?      @db.Uuid
+  taskId      String?      @db.Uuid
+  commentId   String?      @db.Uuid
+  actorId     String?      @db.Uuid
+  actor       User?        @relation(fields: [actorId], references: [id], onDelete: SetNull)
+  type        ActivityType
+  summary     String
+  metadata    Json?
+  createdAt   DateTime     @default(now())
+
+  @@index([workspaceId, createdAt])
+  @@index([projectId, createdAt])
+  @@index([taskId])
+}
